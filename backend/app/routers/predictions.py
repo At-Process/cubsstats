@@ -127,13 +127,15 @@ def get_upcoming_predictions(
 ):
     """Predict outcomes for upcoming scheduled Cubs games.
 
-    The schedule is pulled live from the MLB Stats API (the local ``games``
-    table only ever holds games seeded/backfilled up to a past window, so it
-    goes stale for future games). Win probability uses the trained model when
-    team stats are available, otherwise falls back to a home-field baseline.
+    The schedule is pulled live from the MLB Stats API (the games table
+    otherwise goes stale for future games). Fetched games are persisted so the
+    trained model can build features for them; win probability falls back to a
+    home-field baseline only when features can't be built (e.g. no history).
     """
     import logging
-    from app.services.ingestion import fetch_schedule, TEAM_ABBR_MAP
+    from app.services.ingestion import (
+        fetch_schedule, TEAM_ABBR_MAP, parse_mlb_api_games, upsert_games,
+    )
 
     logger = logging.getLogger(__name__)
 
@@ -162,6 +164,15 @@ def get_upcoming_predictions(
     upcoming.sort(key=lambda pair: pair[0])
     upcoming = upcoming[:limit]
 
+    # Persist the fetched games so the feature builders (which look up by
+    # game_pk) can run the trained model instead of always hitting the
+    # baseline. Non-fatal: on failure we still return the schedule + baseline.
+    try:
+        upsert_games(parse_mlb_api_games([g for _, g in upcoming], db), db)
+    except Exception as e:
+        logger.error(f"Persisting upcoming games failed: {e}")
+        db.rollback()
+
     results = []
     for gd, g in upcoming:
         teams = g.get("teams", {})
@@ -181,13 +192,14 @@ def get_upcoming_predictions(
 
         game_pk = g.get("gamePk")
 
-        # Try the trained model; fall back to home-field baseline when the DB
-        # has no stats/history to model from (the common case).
+        # Run the trained model on the now-persisted game. build_prediction_features
+        # is designed for scheduled games (uses recent completed games); fall back
+        # to a home-field baseline only when features truly can't be built.
         win_prob = None
         try:
-            features = build_game_features(game_pk, db)
+            features = build_prediction_features(game_pk, db)
             if features is None:
-                features = build_prediction_features(game_pk, db)
+                features = build_game_features(game_pk, db)
             if features is not None:
                 win_prob = predict_game_outcome(features).get("win_probability")
         except Exception as e:

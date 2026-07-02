@@ -15,13 +15,15 @@ export default function PredictionRow({
   const pct = isModelReady ? (winProbability * 100).toFixed(0) : null
   const pctNum = pct ? parseFloat(pct) : null
 
+  // Thresholds align with getFavorLabel below (FAVORED >=55, TOSS-UP 45-54,
+  // UNDERDOG <45) so the win% color never contradicts the badge.
   const getProbColor = (p) => {
     if (p == null) return '#8892A8'
-    if (p >= 58) return '#34D399'
-    if (p >= 52) return '#6EE7B7'
-    if (p >= 48) return '#8892A8'
-    if (p >= 42) return '#FBBF24'
-    return '#F87171'
+    if (p >= 60) return '#34D399'   // strong favorite
+    if (p >= 55) return '#6EE7B7'   // favored
+    if (p >= 45) return '#8892A8'   // toss-up (gray)
+    if (p >= 40) return '#FBBF24'   // underdog
+    return '#F87171'                // heavy underdog
   }
 
   const getFavorLabel = (p) => {

@@ -256,7 +256,7 @@ function PredictionsPanel({ upcomingPredictions, loading }) {
           </h3>
         </div>
         <span className="text-[9px] text-text-secondary italic">
-          Updated weekly
+          Live from MLB
         </span>
       </div>
 
