@@ -499,5 +499,44 @@ class TrainedModel(Base):
 # Create all tables
 # ---------------------------------------------------------------------------
 
+def _sync_columns():
+    """Idempotently add model columns that are missing from existing tables.
+
+    create_all() creates missing tables but never alters existing ones, so a
+    database created before a column was added to its model drifts out of sync
+    (e.g. games.day_night, whose absence 500s any query loading the Game
+    entity). This adds each missing column as a nullable ALTER TABLE ADD
+    COLUMN. Additive only — it never drops or alters existing columns, and is a
+    no-op once the schema is in sync (so it's safe on an already-correct DB).
+    """
+    import logging
+    from sqlalchemy import inspect, text
+
+    logger = logging.getLogger(__name__)
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    prep = engine.dialect.identifier_preparer
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # create_all already made it with the full schema
+        existing_cols = {c["name"] for c in inspector.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in existing_cols:
+                continue
+            col_type = col.type.compile(dialect=engine.dialect)
+            ddl = (
+                f"ALTER TABLE {prep.quote(table.name)} "
+                f"ADD COLUMN {prep.quote(col.name)} {col_type}"
+            )
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(ddl))
+                logger.warning(f"Schema sync: added missing column {table.name}.{col.name}")
+            except Exception as e:
+                logger.error(f"Schema sync failed for {table.name}.{col.name}: {e}")
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _sync_columns()
