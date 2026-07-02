@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from typing import Optional
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
-from app.models.database import get_db, Game, TeamSeasonStats, Player
+from app.models.database import get_db, Game, TeamSeasonStats
 from app.services.ml_engine import (
     predict_game_outcome, predict_win_trend,
     detect_regression_flags, get_model_status,
@@ -125,75 +125,86 @@ def get_upcoming_predictions(
     limit: int = Query(10, ge=1, le=30),
     db: Session = Depends(get_db),
 ):
-    """Predict outcomes for ALL upcoming scheduled Cubs games."""
-    season = date.today().year
+    """Predict outcomes for upcoming scheduled Cubs games.
 
-    upcoming = db.query(Game).filter(
-        Game.game_date >= date.today(),
-        ((Game.home_team == "CHC") | (Game.away_team == "CHC")),
-        Game.status == "scheduled",
-    ).order_by(Game.game_date.asc()).limit(limit).all()
+    The schedule is pulled live from the MLB Stats API (the local ``games``
+    table only ever holds games seeded/backfilled up to a past window, so it
+    goes stale for future games). Win probability uses the trained model when
+    team stats are available, otherwise falls back to a home-field baseline.
+    """
+    import logging
+    from app.services.ingestion import fetch_schedule, TEAM_ABBR_MAP
 
-    if not upcoming:
+    logger = logging.getLogger(__name__)
+
+    # Match live_context: compute "today" in US Central, not naive server time.
+    today = datetime.now(timezone(timedelta(hours=-5))).date()
+
+    try:
+        raw = fetch_schedule(today, today + timedelta(days=14), team_id=112, game_type="R")
+    except Exception as e:
+        logger.error(f"Upcoming schedule fetch failed: {e}")
         return {"games": []}
 
-    cubs_stats = db.query(TeamSeasonStats).filter(
-        TeamSeasonStats.team == "CHC",
-        TeamSeasonStats.season == season,
-    ).first()
-
-    all_games = _get_cubs_games(season, db)
+    # Keep only future ("Preview") games, sorted by date, capped at limit.
+    upcoming = []
+    for g in raw:
+        if g.get("status", {}).get("abstractGameState") != "Preview":
+            continue
+        game_date_str = g.get("officialDate") or g.get("gameDate", "")[:10]
+        try:
+            gd = date.fromisoformat(game_date_str)
+        except (ValueError, TypeError):
+            continue
+        if gd < today:
+            continue
+        upcoming.append((gd, g))
+    upcoming.sort(key=lambda pair: pair[0])
+    upcoming = upcoming[:limit]
 
     results = []
-    for game in upcoming:
+    for gd, g in upcoming:
+        teams = g.get("teams", {})
+        home = teams.get("home", {})
+        away = teams.get("away", {})
+        home_name = home.get("team", {}).get("name", "")
+        away_name = away.get("team", {}).get("name", "")
+        home_abbr = TEAM_ABBR_MAP.get(home_name, home_name[:3].upper())
+        away_abbr = TEAM_ABBR_MAP.get(away_name, away_name[:3].upper())
+        is_home = home_abbr == "CHC"
+        opp = away_abbr if is_home else home_abbr
+
+        cubs_side = home if is_home else away
+        opp_side = away if is_home else home
+        cubs_starter = cubs_side.get("probablePitcher", {}).get("fullName") or "TBD"
+        opp_starter = opp_side.get("probablePitcher", {}).get("fullName") or "TBD"
+
+        game_pk = g.get("gamePk")
+
+        # Try the trained model; fall back to home-field baseline when the DB
+        # has no stats/history to model from (the common case).
+        win_prob = None
         try:
-            opp = game.away_team if game.home_team == "CHC" else game.home_team
-            is_home = game.home_team == "CHC"
-
-            # Build features from game history (no hardcoded defaults)
-            features = build_game_features(game.game_pk, db)
+            features = build_game_features(game_pk, db)
             if features is None:
-                features = build_prediction_features(game.game_pk, db)
-
-            if features is None:
-                win_prob = None
-            else:
-                prediction = predict_game_outcome(features)
-                win_prob = prediction.get("win_probability")
-
-            # Look up starter names
-            cubs_starter_name = "TBD"
-            opp_starter_name = "TBD"
-            cubs_starter_id = game.home_starter_id if is_home else game.away_starter_id
-            opp_starter_id = game.away_starter_id if is_home else game.home_starter_id
-            if cubs_starter_id:
-                p = db.query(Player).filter(Player.mlb_id == cubs_starter_id).first()
-                if p:
-                    cubs_starter_name = p.name
-            if opp_starter_id:
-                p = db.query(Player).filter(Player.mlb_id == opp_starter_id).first()
-                if p:
-                    opp_starter_name = p.name
-
-            results.append({
-                "game_pk": game.game_pk,
-                "date": game.game_date.isoformat(),
-                "opponent": opp,
-                "is_home": is_home,
-                "win_probability": win_prob,
-                "cubs_starter": cubs_starter_name,
-                "opp_starter": opp_starter_name,
-                "day_night": game.day_night or "night",
-            })
+                features = build_prediction_features(game_pk, db)
+            if features is not None:
+                win_prob = predict_game_outcome(features).get("win_probability")
         except Exception as e:
-            # Don't let one game failure kill the whole list
-            results.append({
-                "game_pk": game.game_pk,
-                "date": game.game_date.isoformat(),
-                "opponent": game.away_team if game.home_team == "CHC" else game.home_team,
-                "is_home": game.home_team == "CHC",
-                "win_probability": None,
-            })
+            logger.debug(f"Win-prob model failed for game {game_pk}: {e}")
+        if win_prob is None:
+            win_prob = 0.54 if is_home else 0.46
+
+        results.append({
+            "game_pk": game_pk,
+            "date": gd.isoformat(),
+            "opponent": opp,
+            "is_home": is_home,
+            "win_probability": win_prob,
+            "cubs_starter": cubs_starter,
+            "opp_starter": opp_starter,
+            "day_night": g.get("dayNight") or "night",
+        })
 
     return {"games": results}
 
